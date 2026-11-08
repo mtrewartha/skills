@@ -1,0 +1,114 @@
+name: Publish skills
+
+# Every push to main is treated as a release: each repo the GitHub App is
+# installed on (other than this one) gets a PR (auto-merged) that syncs its
+# .agents/skills and .claude/skills to match this repo.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - ".github/workflows/**"
+      - "LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      repos: ${{ steps.read.outputs.repos }}
+    steps:
+      # Read-only token covering every repo the app is installed on.
+      - id: list-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.SKILLS_SYNC_CLIENT_ID }}
+          private-key: ${{ secrets.SKILLS_SYNC_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-metadata: read
+
+      # Consumers = every repo the app is installed on, except this one, forks and archived repos.
+      - id: read
+        env:
+          GH_TOKEN: ${{ steps.list-token.outputs.token }}
+          SELF: ${{ github.repository }}
+        run: |
+          repos="$(gh api /installation/repositories --paginate \
+            --jq '.repositories[] | select((.archived or .fork) | not) | .full_name' \
+            | grep -vxF "$SELF" \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))' || true)"
+          echo "repos=${repos:-[]}" >> "$GITHUB_OUTPUT"
+          echo "Consumers: ${repos:-[]}"
+
+  publish:
+    needs: targets
+    if: needs.targets.outputs.repos != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(needs.targets.outputs.repos) }}
+    # One run per consumer at a time; a newer push queues behind and syncs the latest state.
+    concurrency:
+      group: publish-skills-${{ matrix.repo }}
+      cancel-in-progress: false
+    steps:
+      - id: parts
+        run: |
+          echo "owner=${REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${REPO#*/}" >> "$GITHUB_OUTPUT"
+        env:
+          REPO: ${{ matrix.repo }}
+
+      # Short-lived token scoped to this one consumer repo.
+      - id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.SKILLS_SYNC_CLIENT_ID }}
+          private-key: ${{ secrets.SKILLS_SYNC_PRIVATE_KEY }}
+          owner: ${{ steps.parts.outputs.owner }}
+          repositories: ${{ steps.parts.outputs.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: source
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ matrix.repo }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: target
+
+      - name: Sync skills into consumer
+        run: source/scripts/sync-skills.sh target
+
+      - id: pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          path: target
+          token: ${{ steps.app-token.outputs.token }}
+          branch: skills-sync
+          delete-branch: true
+          commit-message: "Update skills from ${{ github.repository }}@${{ github.sha }}"
+          title: "Update skills"
+          body: |
+            Automated sync from [${{ github.repository }}@${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}).
+
+            Replaces `.agents/skills` and refreshes the `.claude/skills` symlinks.
+
+      - name: Merge
+        if: steps.pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.pr.outputs.pull-request-number }}
+          REPO: ${{ matrix.repo }}
+        run: |
+          # Prefer auto-merge (waits for required checks). If the repo has no required
+          # checks, auto-merge is rejected because the PR is already mergeable; merge now.
+          gh pr merge "$PR" --repo "$REPO" --auto --squash \
+            || gh pr merge "$PR" --repo "$REPO" --squash
